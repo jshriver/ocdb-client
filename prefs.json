@@ -1,0 +1,7 @@
+{
+    "userId": "1",
+    "depth": 28,
+    "engine": "./stockfish",
+    "threads": "4",
+    "syzygy": "/syzygy"
+}
