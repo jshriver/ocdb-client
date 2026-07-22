@@ -325,13 +325,26 @@ fn main() {
         println!("🛠️  Setting threads to {}", t);
     }
 
-    // Optional Syzygy path
+    // Optional Syzygy path — skip entirely if empty, since "setoption ... value "
+    // with a blank value is meaningless and some engines respond to it oddly.
     if let Some(ref path) = prefs.syzygy {
-        write!(stdin, "setoption name SyzygyPath value {}\n", path).unwrap();
-        stdin.flush().unwrap();
-        println!("🛠️  Setting SyzygyPath to {}", path);
-        // consume two info lines the engine emits
-        lines.by_ref().take(2).for_each(|_| {});
+        if !path.is_empty() {
+            write!(stdin, "setoption name SyzygyPath value {}\n", path).unwrap();
+            stdin.flush().unwrap();
+            println!("🛠️  Setting SyzygyPath to {}", path);
+        }
+    }
+
+    // Sync with the engine using the UCI protocol's actual handshake
+    // (isready/readyok) instead of guessing how many lines setoption calls
+    // will print. Engines emit a variable number of info/string lines here —
+    // sometimes zero — so blindly consuming a fixed count (as the old code
+    // did) can block forever waiting for output that never arrives.
+    write!(stdin, "isready\n").unwrap();
+    stdin.flush().unwrap();
+    for line in lines.by_ref() {
+        let line = line.unwrap_or_default();
+        if line.trim() == "readyok" { break; }
     }
 
     let agent = build_agent();
