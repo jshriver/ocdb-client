@@ -418,19 +418,52 @@ fn main() {
                     }
                 };
 
-                let pv_short = pv_display.chars().take(20).collect::<String>();
+                // Cap how wide the value column is allowed to grow (long PVs
+                // would otherwise stretch the box arbitrarily wide); anything
+                // longer gets truncated with an ellipsis.
+                const MAX_VALUE_WIDTH: usize = 40;
+                let pv_short = if pv_display.chars().count() > MAX_VALUE_WIDTH {
+                    format!("{}…", pv_display.chars().take(MAX_VALUE_WIDTH - 1).collect::<String>())
+                } else {
+                    pv_display.clone()
+                };
                 let elapsed  = run_start.elapsed().as_secs();
 
+                let depth_str = last_info.depth.to_string();
+                let rows: [(&str, &str); 7] = [
+                    ("Ply",      &depth_str),
+                    ("Score",    &last_info.score),
+                    ("NPS",      &last_info.nps),
+                    ("Mate",     &last_info.mate),
+                    ("PV",       &pv_short),
+                    ("Nodes",    &last_info.nodes),
+                    ("Time(ms)", &last_info.time_ms),
+                ];
+
+                // Size the columns to the widest label/value actually being
+                // printed (with a floor and cap on the value column) so the
+                // border always lines up, no matter how long the PV is.
+                let label_w = rows.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
+                let value_w = rows.iter()
+                    .map(|(_, v)| v.chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .clamp(11, MAX_VALUE_WIDTH);
+
+                let top = format!("┌{}┬{}┐", "─".repeat(label_w + 2), "─".repeat(value_w + 2));
+                let sep = format!("├{}┼{}┤", "─".repeat(label_w + 2), "─".repeat(value_w + 2));
+                let bot = format!("└{}┴{}┘", "─".repeat(label_w + 2), "─".repeat(value_w + 2));
+
                 println!("{}{}Engine Analysis Complete{}", BOLD, MAGENTA, RESET);
-                println!("┌───────────────┬─────────────┐");
-                println!("│ Ply           │ {:<11} │", last_info.depth);
-                println!("│ Score         │ {:<11} │", last_info.score);
-                println!("│ NPS           │ {:<11} │", last_info.nps);
-                println!("│ Mate          │ {:<11} │", last_info.mate);
-                println!("│ PV            │ {:<11} │", pv_short);
-                println!("│ Nodes         │ {:<11} │", last_info.nodes);
-                println!("│ Time(ms)      │ {:<11} │", last_info.time_ms);
-                println!("└───────────────┴─────────────┘");
+                println!("{}", top);
+                for (i, (label, value)) in rows.iter().enumerate() {
+                    println!("│ {:<lw$} │ {:<vw$} │", label, value, lw = label_w, vw = value_w);
+                    if i == 3 {
+                        // visually separate the PV row from the stats above it
+                        println!("{}", sep);
+                    }
+                }
+                println!("{}", bot);
 
                 // Send results — JSON body matching ScoreSubmission on the server.
                 let payload = ScoreSubmission {
