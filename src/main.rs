@@ -126,11 +126,11 @@ fn ocdb_host_info(user_id: &str, session_id: &str) {
 
     // NOTE: left disabled, same as before — not re-enabling this without
     // understanding why it posts to a bare LAN IP rather than openchessdb.org.
-    //let client = reqwest::blocking::Client::new();
-    //let _ = client
-    //    .post("http://192.168.1.102/v2/updatenodes.php")
-    //    .form(&params)
-    //    .send();
+    //let _ = ureq::post("http://192.168.1.102/v2/updatenodes.php")
+    //    .send_form(&[
+    //        ("id", params["id"].as_str()),
+    //        // ...
+    //    ]);
     let _ = params; // silence unused-var warning while the above stays disabled
 }
 
@@ -226,6 +226,55 @@ fn fmt_elapsed(secs: u64) -> String {
     if h > 0 { format!("{}:{:02}:{:02}", h, m, s) } else { format!("{}:{:02}", m, s) }
 }
 
+// ─── HTTP helpers (ureq) ───────────────────────────────────────────────────────
+// ureq's default agent has NO built-in timeout unless the OS-level TCP
+// connect hangs. We build an agent with explicit connect/read/write timeouts
+// so a stalled connection surfaces as a clear error within a bounded time
+// instead of hanging the whole program forever.
+fn build_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(20))
+        .timeout_write(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30)) // overall request timeout
+        .build()
+}
+
+fn fetch_fen(agent: &ureq::Agent) -> Result<FenData, String> {
+    let resp = agent
+        .get("https://openchessdb.org/v2/getfen")
+        .call()
+        .map_err(|e| format!("request failed: {}", e))?;
+
+    let body = resp
+        .into_string()
+        .map_err(|e| format!("failed to read body: {}", e))?;
+
+    serde_json::from_str::<FenData>(&body)
+        .map_err(|e| format!("bad FEN JSON: {} — body was: {}", e, body))
+}
+
+fn submit_score(agent: &ureq::Agent, payload: &ScoreSubmission) -> Result<(u16, String), String> {
+    match agent
+        .post("https://openchessdb.org/v2/sendresults")
+        .send_json(payload)
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.into_string().unwrap_or_default();
+            Ok((status, body))
+        }
+        // ureq treats non-2xx as an Err(Status), so we still need to recover
+        // the status code and body from that case rather than treating it
+        // as a hard failure.
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            Ok((code, body))
+        }
+        Err(e) => Err(format!("{}", e)),
+    }
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────────
 fn main() {
     let header_art = r#"
@@ -285,23 +334,16 @@ fn main() {
         lines.by_ref().take(2).for_each(|_| {});
     }
 
-    let client = reqwest::blocking::Client::new();
+    let agent = build_agent();
 
     // ── Main loop ───────────────────────────────────────────────────────────────
     loop {
         // Fetch FEN
-        let resp = match client.get("https://openchessdb.org/v2/getfen").send() {
-            Ok(r)  => r,
-            Err(e) => { eprintln!("{}Failed to fetch FEN: {}{}", RED, e, RESET); thread::sleep(Duration::from_secs(2)); continue; }
-        };
-        let body = match resp.text() {
-            Ok(b) => b,
-            Err(e) => { eprintln!("{}Failed to read FEN response body: {}{}", RED, e, RESET); thread::sleep(Duration::from_secs(2)); continue; }
-        };
-        let fen_data: FenData = match serde_json::from_str(&body) {
+        eprintln!("{}Requesting FEN...{}", CYAN, RESET);
+        let fen_data = match fetch_fen(&agent) {
             Ok(d)  => d,
             Err(e) => {
-                eprintln!("{}Bad FEN JSON: {} — body was: {}{}", RED, e, body, RESET);
+                eprintln!("{}Failed to fetch FEN: {}{}", RED, e, RESET);
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
@@ -391,15 +433,9 @@ fn main() {
                     mate: non_empty(&last_info.mate),
                 };
 
-                match client
-                    .post("https://openchessdb.org/v2/sendresults")
-                    .json(&payload)
-                    .send()
-                {
-                    Ok(r) => {
-                        let status = r.status();
-                        let resp_body = r.text().unwrap_or_default();
-                        if status.is_success() {
+                match submit_score(&agent, &payload) {
+                    Ok((status, resp_body)) => {
+                        if (200..300).contains(&status) {
                             println!("{}Response code:{} {}", BLUE, RESET, status);
                         } else {
                             println!(
