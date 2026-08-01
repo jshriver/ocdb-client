@@ -1,10 +1,12 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write, copy};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::fs;
 
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use shakmaty::{Chess, Position, CastlingMode};
 use shakmaty::fen::Fen;
@@ -20,8 +22,15 @@ const BLUE:  &str  = "\x1b[94m";
 const MAGENTA:&str = "\x1b[95m";
 const CYAN:  &str  = "\x1b[96m";
 
+// ─── Stockfish auto-provisioning ───────────────────────────────────────────────
+/// Bump this when a new major Stockfish version is released, or replace with
+/// a call to https://api.github.com/repos/official-stockfish/Stockfish/releases/latest
+/// if you want the client to always grab the newest build (watch the 60/hr
+/// unauthenticated GitHub API rate limit if you do that per-client).
+const STOCKFISH_RELEASE_TAG: &str = "sf_18";
+
 // ─── Prefs ─────────────────────────────────────────────────────────────────────
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Prefs {
     engine:  String,
     depth:   u32,
@@ -271,6 +280,213 @@ fn heartbeat(agent: &ureq::Agent, session_id: &mut Option<String>, snapshot: &Sn
     }
 }
 
+// ─── Stockfish auto-provisioning ───────────────────────────────────────────────
+// Downloads and extracts a matching Stockfish build if one isn't already
+// sitting in the working directory, and writes a default prefs.json if that's
+// missing too — so a fresh checkout of the client works with zero manual setup.
+
+fn tier_suffix(tier: &str) -> String {
+    if tier == "generic" {
+        String::new()
+    } else {
+        format!("-{tier}")
+    }
+}
+
+/// Returns (asset filename, "zip" | "tar") for the Stockfish release asset
+/// matching this machine's OS/arch/CPU tier.
+fn stockfish_asset_name(snapshot: &Snapshot) -> Result<(String, &'static str), String> {
+    match snapshot.os.as_str() {
+        "windows" => {
+            if snapshot.arch == "aarch64" {
+                return Err("No official Windows-on-ARM Stockfish build exists.".into());
+            }
+            Ok((
+                format!("stockfish-windows-x86-64{}.zip", tier_suffix(&snapshot.cpu_tier)),
+                "zip",
+            ))
+        }
+        "macos" => {
+            if snapshot.arch == "aarch64" {
+                Ok(("stockfish-macos-m1-apple-silicon.tar".into(), "tar"))
+            } else {
+                Ok((
+                    format!("stockfish-macos-x86-64{}.tar", tier_suffix(&snapshot.cpu_tier)),
+                    "tar",
+                ))
+            }
+        }
+        "linux" => {
+            // Builds are labeled "ubuntu" but run fine on most modern glibc distros.
+            Ok((
+                format!("stockfish-ubuntu-x86-64{}.tar", tier_suffix(&snapshot.cpu_tier)),
+                "tar",
+            ))
+        }
+        other => Err(format!("Unsupported OS for Stockfish auto-download: {other}")),
+    }
+}
+
+/// A separate agent from `build_agent()`, since the FEN/score endpoints are
+/// small JSON calls that should fail fast, while a ~40MB engine download over
+/// a slow connection legitimately needs minutes, not seconds.
+fn build_download_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
+        .build()
+}
+
+fn download_asset(agent: &ureq::Agent, filename: &str) -> Result<PathBuf, String> {
+    let url = format!(
+        "https://github.com/official-stockfish/Stockfish/releases/download/{STOCKFISH_RELEASE_TAG}/{filename}"
+    );
+    println!("⬇️  Downloading {filename}...");
+
+    let resp = agent
+        .get(&url)
+        .call()
+        .map_err(|e| format!("requesting {url}: {e}"))?;
+
+    let total: u64 = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "   📦 [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})",
+        )
+        .unwrap()
+        .progress_chars("=> "),
+    );
+
+    let dest = std::env::temp_dir().join(filename);
+    let mut out = File::create(&dest).map_err(|e| e.to_string())?;
+    let mut reader = pb.wrap_read(resp.into_reader());
+    copy(&mut reader, &mut out).map_err(|e| e.to_string())?;
+    pb.finish_with_message("done");
+
+    println!("✅ Download complete");
+    Ok(dest)
+}
+
+/// Pulls the single Stockfish executable out of the downloaded archive and
+/// writes it to `out_path`. Release archives bundle the full source tree
+/// alongside the binary, so this specifically hunts for the one file that
+/// matches the executable naming pattern rather than extracting everything.
+fn extract_binary(archive_path: &Path, kind: &str, out_path: &Path) -> Result<(), String> {
+    println!("📂 Extracting Stockfish binary...");
+    let mut found = false;
+
+    if kind == "zip" {
+        let file = File::open(archive_path).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipArchive::new(BufReader::new(file)).map_err(|e| e.to_string())?;
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+            if entry.name().ends_with(".exe") {
+                let mut out = File::create(out_path).map_err(|e| e.to_string())?;
+                copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+                found = true;
+                break;
+            }
+        }
+    } else {
+        let file = File::open(archive_path).map_err(|e| e.to_string())?;
+        let mut archive = tar::Archive::new(file);
+        for entry in archive.entries().map_err(|e| e.to_string())? {
+            let mut entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path().map_err(|e| e.to_string())?.to_path_buf();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // The binary is the one file named "stockfish-<platform>-..."
+            // with no extension.
+            if name.starts_with("stockfish-") && !name.contains('.') {
+                let mut out = File::create(out_path).map_err(|e| e.to_string())?;
+                copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if !found {
+        return Err("♟️  Couldn't find a Stockfish executable inside the downloaded archive".into());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(out_path).map_err(|e| e.to_string())?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(out_path, perms).map_err(|e| e.to_string())?;
+    }
+
+    println!("✅ Extracted to {}", out_path.display());
+    Ok(())
+}
+
+/// Ensures a Stockfish binary exists in the current working directory (i.e.
+/// next to prefs.json, matching where `Prefs.engine` expects it), downloading
+/// and extracting a build matching this CPU's tier if necessary. Returns the
+/// path to it.
+fn ensure_stockfish(agent: &ureq::Agent, snapshot: &Snapshot) -> Result<PathBuf, String> {
+    let exe_name = if snapshot.os == "windows" { "stockfish.exe" } else { "stockfish" };
+    let local_path = std::env::current_dir().map_err(|e| e.to_string())?.join(exe_name);
+
+    println!("\n♟️  Checking for {exe_name}...");
+
+    if local_path.exists() {
+        println!("✅ Found existing {exe_name} at {}", local_path.display());
+        return Ok(local_path);
+    }
+
+    println!("⚠️  Not found — fetching a matching build from GitHub...");
+
+    let (asset_name, kind) = stockfish_asset_name(snapshot)?;
+    let archive_path = download_asset(agent, &asset_name)?;
+    let result = extract_binary(&archive_path, kind, &local_path);
+    fs::remove_file(&archive_path).ok();
+    result?;
+
+    Ok(local_path)
+}
+
+/// Creates prefs.json in the current working directory if it doesn't already
+/// exist, using the Stockfish path we just ensured and the logical core
+/// count from the hardware snapshot as sane defaults. Syzygy is left blank
+/// (existing code already skips setting SyzygyPath when empty) since we
+/// can't assume every user has tablebases installed.
+fn ensure_prefs(stockfish_path: &Path, snapshot: &Snapshot) -> Result<(), String> {
+    let prefs_path = std::env::current_dir().map_err(|e| e.to_string())?.join("prefs.json");
+
+    println!("\n📝 Checking for prefs.json...");
+
+    if prefs_path.exists() {
+        println!("✅ Found existing prefs.json at {}", prefs_path.display());
+        return Ok(());
+    }
+
+    // "./stockfish" / "./stockfish.exe" — relative, matching how `Command::new`
+    // resolves the engine path against the current working directory below.
+    let engine_name = stockfish_path.file_name().and_then(|n| n.to_str()).unwrap_or("stockfish");
+    let engine = format!("./{engine_name}");
+
+    let prefs = Prefs {
+        user_id: "1".to_string(),
+        depth: 28,
+        engine,
+        threads: Some(snapshot.logical_cores.to_string()),
+        syzygy: Some(String::new()),
+    };
+
+    let json = serde_json::to_string_pretty(&prefs).map_err(|e| e.to_string())?;
+    fs::write(&prefs_path, json).map_err(|e| e.to_string())?;
+
+    println!("⚠️  Not found — created prefs.json at {}", prefs_path.display());
+    Ok(())
+}
+
 // ─── Rainbow spinner ───────────────────────────────────────────────────────────
 struct RainbowSpinner {
     stop_flag: Arc<AtomicBool>,
@@ -422,6 +638,27 @@ fn main() {
     println!("{}", header_art);
     println!("\nThank you for contributing your compute time and resources.\n");
 
+    // ── Hardware snapshot (needed both for Stockfish tier selection below and
+    // for session telemetry later) ──────────────────────────────────────────────
+    let snapshot = collect_snapshot();
+
+    // ── First-run setup: fetch a matching Stockfish build and/or generate a
+    // default prefs.json if either is missing, so a fresh checkout works with
+    // no manual setup beyond running the binary ─────────────────────────────────
+    let download_agent = build_download_agent();
+    let stockfish_path = match ensure_stockfish(&download_agent, &snapshot) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("{}Failed to prepare Stockfish: {}{}", RED, e, RESET);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = ensure_prefs(&stockfish_path, &snapshot) {
+        eprintln!("{}Failed to create prefs.json: {}{}", RED, e, RESET);
+        std::process::exit(1);
+    }
+
     // ── Load prefs ──────────────────────────────────────────────────────────────
     let prefs_raw = fs::read_to_string("prefs.json").expect("Cannot open prefs.json");
     let prefs: Prefs = serde_json::from_str(&prefs_raw).expect("Invalid prefs.json");
@@ -429,7 +666,6 @@ fn main() {
     let agent = build_agent();
 
     // ── Session telemetry (best-effort — never blocks or aborts the worker) ────
-    let snapshot = collect_snapshot();
     let mut session_id: Option<String> = create_session(&agent);
     match &session_id {
         Some(sid) => {
