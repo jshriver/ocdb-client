@@ -4,7 +4,6 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::fs;
-use std::net;
 
 use serde::{Deserialize, Serialize};
 use shakmaty::{Chess, Position, CastlingMode};
@@ -93,45 +92,182 @@ fn uci_pv_to_san(fen: &str, pv: &str) -> Result<String, String> {
     Ok(sans.join(" "))
 }
 
-// ─── Host-info helper ──────────────────────────────────────────────────────────
-fn ocdb_host_info(user_id: &str, session_id: &str) {
+// ─── Session telemetry ──────────────────────────────────────────────────────
+// Reports anonymous hardware info to openchessdb.org so the dashboard can
+// show current worker fleet composition. Every call here is best-effort:
+// telemetry is incidental to ocdb-client's real job (scoring FENs), so a
+// failure here must never interrupt or abort analysis.
+
+#[derive(Serialize, Debug, Clone)]
+struct Snapshot {
+    os: String,
+    arch: String,
+    cpu_tier: String,
+    logical_cores: usize,
+    physical_cores: Option<usize>,
+    ram_total_mb: u64,
+}
+
+#[derive(Deserialize, Debug)]
+struct CreateSessionResponse {
+    session_id: String,
+    #[allow(dead_code)]
+    created_at: String,
+}
+
+/// Returns true if this is an AMD CPU whose bmi2 implementation is known to
+/// be slow (pre-Zen3 microcode emulation of pdep/pext) rather than a real
+/// fast path. Intel bmi2 is fast everywhere it's supported, so this only
+/// matters for AMD.
+fn is_amd_slow_bmi2() -> bool {
+    use raw_cpuid::CpuId;
+    let cpuid = CpuId::new();
+
+    let is_amd = cpuid
+        .get_vendor_info()
+        .map(|v| v.as_str() == "AuthenticAMD")
+        .unwrap_or(false);
+
+    if !is_amd {
+        return false;
+    }
+
+    // Zen 3 corresponds to effective family 0x19+. Zen/Zen+/Zen2 (family
+    // 0x17) have the slow microcoded pdep/pext. If we can't read family
+    // info at all, assume the slow path since that's the safer default.
+    match cpuid.get_feature_info() {
+        Some(finfo) => finfo.extended_family_id() + finfo.family_id() < 0x19,
+        None => true,
+    }
+}
+
+/// Picks the best instruction-set tier this CPU can actually use well.
+/// Falls back gracefully on non-x86_64 targets (e.g. a Raspberry Pi's
+/// aarch64, or Apple Silicon).
+fn cpu_tier() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let has_bmi2 = is_x86_feature_detected!("bmi2") && !is_amd_slow_bmi2();
+
+        if is_x86_feature_detected!("avx512f") {
+            "avx512"
+        } else if has_bmi2 {
+            "bmi2"
+        } else if is_x86_feature_detected!("avx2") {
+            "avx2"
+        } else if is_x86_feature_detected!("sse4.1") && is_x86_feature_detected!("popcnt") {
+            "sse41-popcnt"
+        } else {
+            "generic"
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        "generic"
+    }
+}
+
+fn collect_snapshot() -> Snapshot {
     use sysinfo::System;
     let mut sys = System::new_all();
     sys.refresh_all();
 
-    let hostname  = System::host_name().unwrap_or_default();
-    let os_name   = System::name().unwrap_or_default();
-    let os_ver    = System::os_version().unwrap_or_default();
-    let kernel    = System::kernel_version().unwrap_or_default();
+    Snapshot {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        cpu_tier: cpu_tier().to_string(),
+        logical_cores: sys.cpus().len(),
+        physical_cores: sys.physical_core_count(),
+        ram_total_mb: sys.total_memory() / 1024 / 1024,
+    }
+}
 
-    let total_mem = sys.total_memory();   // bytes
-    let cpu_count = sys.cpus().len();
+/// Calls /v2/create-session. Returns None (rather than erroring out the
+/// whole program) if the API is unreachable — the worker can still fetch
+/// FENs and submit scores without a session, it just won't show up on the
+/// dashboard until the next successful attempt.
+fn create_session(agent: &ureq::Agent) -> Option<String> {
+    match agent.get("https://openchessdb.org/v2/create-session").call() {
+        Ok(resp) => match resp.into_json::<CreateSessionResponse>() {
+            Ok(r) => Some(r.session_id),
+            Err(e) => {
+                eprintln!("{}create-session: bad response: {}{}", RED, e, RESET);
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("{}create-session failed: {}{}", RED, e, RESET);
+            None
+        }
+    }
+}
 
-    // Best-effort local IP
-    let ip = net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "unknown".into());
+/// Result of a heartbeat attempt, so the caller can react to a purged
+/// session (404) without polling or retrying blindly.
+enum HeartbeatResult {
+    Ok,
+    SessionGone,
+    OtherError,
+}
 
-    let mut params = std::collections::HashMap::new();
-    params.insert("id",       user_id.to_string());
-    params.insert("pid",      session_id.to_string());
-    params.insert("ip",       ip);
-    params.insert("hostname", hostname);
-    params.insert("system",   os_name);
-    params.insert("release",  os_ver);
-    params.insert("version",  kernel);
-    params.insert("log_cores",cpu_count.to_string());
-    params.insert("memory",   format!("{:.2}MB", total_mem as f64 / 1024.0 / 1024.0));
+/// Calls /v2/update-session with the current hardware snapshot. This both
+/// reports hardware info and (via the server's ON UPDATE CURRENT_TIMESTAMP
+/// on last_seen) acts as the heartbeat that keeps the session alive and out
+/// of the 1-hour purge — no separate timer needed since this is called once
+/// per FEN cycle, well under an hour even on modest hardware.
+fn update_session(agent: &ureq::Agent, session_id: &str, snapshot: &Snapshot) -> HeartbeatResult {
+    let mut req = agent
+        .get("https://openchessdb.org/v2/update-session")
+        .query("session_id", session_id)
+        .query("os", &snapshot.os)
+        .query("arch", &snapshot.arch)
+        .query("cpu_tier", &snapshot.cpu_tier)
+        .query("logical_cores", &snapshot.logical_cores.to_string())
+        .query("ram_total_mb", &snapshot.ram_total_mb.to_string());
 
-    // NOTE: left disabled, same as before — not re-enabling this without
-    // understanding why it posts to a bare LAN IP rather than openchessdb.org.
-    //let _ = ureq::post("http://192.168.1.102/v2/updatenodes.php")
-    //    .send_form(&[
-    //        ("id", params["id"].as_str()),
-    //        // ...
-    //    ]);
-    let _ = params; // silence unused-var warning while the above stays disabled
+    if let Some(p) = snapshot.physical_cores {
+        req = req.query("physical_cores", &p.to_string());
+    }
+
+    match req.call() {
+        Ok(_) => HeartbeatResult::Ok,
+        Err(ureq::Error::Status(404, _)) => HeartbeatResult::SessionGone,
+        Err(e) => {
+            eprintln!("{}update-session (heartbeat) failed: {}{}", RED, e, RESET);
+            HeartbeatResult::OtherError
+        }
+    }
+}
+
+/// Sends the heartbeat and self-heals if the session was purged (e.g. the
+/// worker was asleep/disconnected long enough that last_seen aged out).
+/// Transient errors are just logged and retried on the next cycle — no
+/// extra requests beyond the one heartbeat unless the session is genuinely
+/// gone, in which case exactly one extra create-session call re-establishes
+/// it.
+fn heartbeat(agent: &ureq::Agent, session_id: &mut Option<String>, snapshot: &Snapshot) {
+    let Some(sid) = session_id.clone() else {
+        // No session yet (startup create-session failed) — try again now,
+        // piggybacking on this workload cycle instead of a separate retry loop.
+        *session_id = create_session(agent);
+        return;
+    };
+
+    match update_session(agent, &sid, snapshot) {
+        HeartbeatResult::Ok => {}
+        HeartbeatResult::SessionGone => {
+            eprintln!("{}Session expired — creating a new one{}", RED, RESET);
+            if let Some(new_sid) = create_session(agent) {
+                // Best-effort initial report on the new session; ignore the
+                // result since the next cycle's heartbeat will retry anyway.
+                let _ = update_session(agent, &new_sid, snapshot);
+                *session_id = Some(new_sid);
+            } else {
+                *session_id = None;
+            }
+        }
+        HeartbeatResult::OtherError => {} // already logged; next cycle retries
+    }
 }
 
 // ─── Rainbow spinner ───────────────────────────────────────────────────────────
@@ -289,8 +425,18 @@ fn main() {
     let prefs_raw = fs::read_to_string("prefs.json").expect("Cannot open prefs.json");
     let prefs: Prefs = serde_json::from_str(&prefs_raw).expect("Invalid prefs.json");
 
-    let session_id = uuid::Uuid::new_v4().to_string();
-    ocdb_host_info(&prefs.user_id, &session_id);
+    let agent = build_agent();
+
+    // ── Session telemetry (best-effort — never blocks or aborts the worker) ────
+    let snapshot = collect_snapshot();
+    let mut session_id: Option<String> = create_session(&agent);
+    match &session_id {
+        Some(sid) => {
+            println!("🔑 Session: {}", sid);
+            let _ = update_session(&agent, sid, &snapshot);
+        }
+        None => println!("⚠️  Session telemetry unavailable — continuing without it"),
+    }
 
     // ── Start chess engine ──────────────────────────────────────────────────────
     let mut proc = Command::new(&prefs.engine)
@@ -346,8 +492,6 @@ fn main() {
         let line = line.unwrap_or_default();
         if line.trim() == "readyok" { break; }
     }
-
-    let agent = build_agent();
 
     // ── Main loop ───────────────────────────────────────────────────────────────
     loop {
@@ -492,6 +636,11 @@ fn main() {
                     }
                     Err(e) => println!("{}Failed to send results:{} {}", RED, RESET, e),
                 }
+
+                // Heartbeat the session right alongside this workload send —
+                // self-heals if the session was purged (404), otherwise this
+                // is the sole extra request per FEN cycle.
+                heartbeat(&agent, &mut session_id, &snapshot);
 
                 println!("{}Elapsed Time:{} {}\n", BLUE, RESET, fmt_elapsed(elapsed));
                 break;

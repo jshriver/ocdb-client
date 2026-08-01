@@ -1,6 +1,6 @@
 [package]
 name    = "ocdb-client"
-version = "0.1.0"
+version = "2.1.0"
 edition = "2024"
 
 [[bin]]
@@ -11,7 +11,7 @@ path = "src/main.rs"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq       = { version = "2", features = ["json"] }
-uuid       = { version = "1",  features = ["v4"] }
 sysinfo    = "0.30"
 ctrlc      = "3"
-shakmaty = "0.30.1"
+shakmaty   = "0.30.1"
+raw-cpuid  = "11"
