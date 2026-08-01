@@ -119,6 +119,7 @@ struct CreateSessionResponse {
 /// be slow (pre-Zen3 microcode emulation of pdep/pext) rather than a real
 /// fast path. Intel bmi2 is fast everywhere it's supported, so this only
 /// matters for AMD.
+#[cfg(target_arch = "x86_64")]
 fn is_amd_slow_bmi2() -> bool {
     use raw_cpuid::CpuId;
     let cpuid = CpuId::new();
