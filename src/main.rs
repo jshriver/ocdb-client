@@ -495,7 +495,7 @@ fn ensure_prefs(stockfish_path: &Path, snapshot: &Snapshot) -> Result<(), String
 
     let prefs = Prefs {
         user_id: "1".to_string(),
-        depth: 28,
+        depth: 32,
         engine,
         threads: Some(snapshot.logical_cores.to_string()),
         syzygy: Some(String::new()),
