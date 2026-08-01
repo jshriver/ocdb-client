@@ -317,14 +317,35 @@ fn stockfish_asset_name(snapshot: &Snapshot) -> Result<(String, &'static str), S
             }
         }
         "linux" => {
-            // Builds are labeled "ubuntu" but run fine on most modern glibc distros.
-            Ok((
-                format!("stockfish-ubuntu-x86-64{}.tar", tier_suffix(&snapshot.cpu_tier)),
-                "tar",
-            ))
+            if snapshot.arch == "aarch64" {
+                // Official Stockfish doesn't publish a separate desktop-Linux
+                // ARM64 build. The Android NDK-compiled binaries are
+                // statically linked and are the officially recommended way
+                // to run Stockfish on aarch64 boards/servers (Raspberry Pi
+                // 5, Ampere Altra, etc.) — see official-stockfish/Stockfish
+                // discussion #5408.
+                let variant = if linux_arm_supports_dotprod() { "armv8-dotprod" } else { "armv8" };
+                Ok((format!("stockfish-android-{variant}.tar"), "tar"))
+            } else {
+                // Builds are labeled "ubuntu" but run fine on most modern glibc distros.
+                Ok((
+                    format!("stockfish-ubuntu-x86-64{}.tar", tier_suffix(&snapshot.cpu_tier)),
+                    "tar",
+                ))
+            }
         }
         other => Err(format!("Unsupported OS for Stockfish auto-download: {other}")),
     }
+}
+
+/// Checks /proc/cpuinfo for the ASIMD dot-product feature flag, which the
+/// "-dotprod" Stockfish builds require for their speedup. Returns false
+/// (the safe, universally-compatible choice) if the file can't be read —
+/// e.g. on non-Linux hosts, or sandboxed/restricted environments.
+fn linux_arm_supports_dotprod() -> bool {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .map(|s| s.contains("asimddp"))
+        .unwrap_or(false)
 }
 
 /// A separate agent from `build_agent()`, since the FEN/score endpoints are
